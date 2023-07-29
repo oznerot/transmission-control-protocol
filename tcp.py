@@ -1,6 +1,11 @@
 import asyncio
+from os import urandom
 from tcputils import *
 
+FLAGS_FIN = 1<<0
+FLAGS_SYN = 1<<1
+FLAGS_RST = 1<<2
+FLAGS_ACK = 1<<4
 
 class Servidor:
     def __init__(self, rede, porta):
@@ -34,21 +39,37 @@ class Servidor:
         if (flags & FLAGS_SYN) == FLAGS_SYN:
             # A flag SYN estar setada significa que é um cliente tentando estabelecer uma conexão nova
             # TODO: talvez você precise passar mais coisas para o construtor de conexão
-            conexao = self.conexoes[id_conexao] = Conexao(self, id_conexao)
+            conexao = self.conexoes[id_conexao] = Conexao(self, id_conexao, seq_no)
             # TODO: você precisa fazer o handshake aceitando a conexão. Escolha se você acha melhor
             # fazer aqui mesmo ou dentro da classe Conexao.
+            conexao.hand_shake(seq_no)
             if self.callback:
                 self.callback(conexao)
+        elif (flags & FLAGS_FIN) == FLAGS_FIN:
+            # A flag FIN estar setada significa que é um cliente tentando finalizar uma conexão existente
+            conexao = self.conexoes.pop(id_conexao)
+            conexao.end_connection()
+            #conexao.fechar()
+
         elif id_conexao in self.conexoes:
             # Passa para a conexão adequada se ela já estiver estabelecida
             self.conexoes[id_conexao]._rdt_rcv(seq_no, ack_no, flags, payload)
         else:
             print('%s:%d -> %s:%d (pacote associado a conexão desconhecida)' %
                   (src_addr, src_port, dst_addr, dst_port))
-
+    
+    def random_no(self):
+        return struct.unpack('I', urandom(4))
+    
 
 class Conexao:
-    def __init__(self, servidor, id_conexao):
+    def __init__(self, servidor, id_conexao, seq_no_sender):
+        #self.ack_no_raw = servidor.random_no()[0]
+        self.seq_no_raw = servidor.random_no()[0]
+        self.seq_no = self.seq_no_raw
+        self.ack_no = 0
+        self.flags = FLAGS_ACK
+
         self.servidor = servidor
         self.id_conexao = id_conexao
         self.callback = None
@@ -63,7 +84,27 @@ class Conexao:
         # TODO: trate aqui o recebimento de segmentos provenientes da camada de rede.
         # Chame self.callback(self, dados) para passar dados para a camada de aplicação após
         # garantir que eles não sejam duplicados e que tenham sido recebidos em ordem.
+        if seq_no != self.ack_no: return
+        if payload == b'': return
+
+        #self.seq_no += len(payload)
+        self.callback(self, payload)
+
+        self.ack_no = seq_no + len(payload)
+        self.send_ack()
+
         print('recebido payload: %r' % payload)
+    
+    def send_ack(self):
+        seq_no = self.seq_no
+        ack_no = self.ack_no
+
+        dest_addr, dest_port, src_addr, src_port = self.id_conexao
+
+        header = make_header(src_port, dest_port, seq_no, ack_no, FLAGS_ACK)
+        segment = fix_checksum(header, src_addr, dest_addr)
+
+        self.servidor.rede.enviar(segment, dest_addr)
 
     # Os métodos abaixo fazem parte da API
 
@@ -74,13 +115,31 @@ class Conexao:
         """
         self.callback = callback
 
-    def enviar(self, dados):
+    def enviar(self, dados=b''):
         """
         Usado pela camada de aplicação para enviar dados
         """
         # TODO: implemente aqui o envio de dados.
         # Chame self.servidor.rede.enviar(segmento, dest_addr) para enviar o segmento
         # que você construir para a camada de rede.
+        dest_addr, dest_port, src_addr, src_port = self.id_conexao
+
+        flags = self.flags
+
+        while len(dados) > 0:
+            seq_no = self.seq_no
+            ack_no = self.ack_no
+            
+            payload = dados[:MSS]
+            
+            header = make_header(src_port, dest_port, seq_no, ack_no, flags)
+            segment = fix_checksum(header + payload, src_addr, dest_addr)
+
+            self.servidor.rede.enviar(segment, dest_addr)      
+            self.seq_no += len(payload)
+
+            dados = dados[MSS:]
+
         pass
 
     def fechar(self):
@@ -88,4 +147,40 @@ class Conexao:
         Usado pela camada de aplicação para fechar a conexão
         """
         # TODO: implemente aqui o fechamento de conexão
+        self.callback(self, b'')
+        dest_addr, dest_port, src_addr, src_port = self.id_conexao
+
+        ack_no = self.ack_no
+        seq_no = self.seq_no
+        flags = FLAGS_FIN
+
+        header = make_header(src_port, dest_port, seq_no, ack_no, flags)
+        segment = fix_checksum(header, src_addr, dest_addr)
+
+        self.servidor.rede.enviar(segment, dest_addr)
+
         pass
+
+    def hand_shake(self, seq_no_sender):
+        dest_addr, dest_port, src_addr, src_port = self.id_conexao
+
+        ack_no = self.ack_no = seq_no_sender + 1
+        seq_no = self.seq_no
+        flags = self.flags | FLAGS_SYN
+
+        header = make_header(src_port, dest_port, seq_no, ack_no, flags)
+        segment = fix_checksum(header, src_addr, dest_addr)
+
+        self.servidor.rede.enviar(segment, dest_addr)
+        self.seq_no += 1
+    
+    def end_connection(self):
+        self.callback(self, b'')
+        self.ack_no += 1
+        self.send_ack()
+
+
+
+
+
+    
