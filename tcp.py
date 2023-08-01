@@ -95,9 +95,10 @@ class Conexao:
 
     def _ack_handler(self, ack_no):
         if ack_no <= self._send_base: return
+        if len(self._buffer) == 0: return
+        if self._timer == None: return
 
         self._send_base = ack_no
-
         for i in range(len(self._buffer)):
             if self._buffer[i][2] == self._send_base:
                 self._buffer = self._buffer[i:]
@@ -105,31 +106,31 @@ class Conexao:
         
         if len(self._buffer) > 0:
             self._timer.start()
-        elif self._timer != None:
+        else:
             self._timer.stop()
+            self._timer = None
 
     def _rdt_rcv(self, seq_no, ack_no, flags, payload):
         # TODO: trate aqui o recebimento de segmentos provenientes da camada de rede.
         # Chame self.callback(self, dados) para passar dados para a camada de aplicação após
         # garantir que eles não sejam duplicados e que tenham sido recebidos em ordem.
         if seq_no != self.ack_no: return   # Ignora segmentos errados e fora de ordem
-
         if ((flags & FLAGS_ACK) == FLAGS_ACK) and (payload == b''):
             self._ack_handler(ack_no)
             return  # Impede responder ACKS com outros ACKs
-
+    
         self.callback(self, payload)
-
         self.ack_no = seq_no + len(payload)
         self._send_ack()
 
         print('recebido payload: %r' % payload)
     
     def _retransmit(self):
+        if self._timer == None: return
+
         dados, dest_addr, _ = self._buffer[0]
         self.servidor.rede.enviar(dados, dest_addr)
 
-        self._timer = Timer(1, self._retransmit)
         self._timer.start()
     
     def _send_ack(self):
@@ -166,9 +167,6 @@ class Conexao:
         # que você construir para a camada de rede.
         dest_addr, dest_port, src_addr, src_port = self.id_conexao
 
-        '''if self._timer != None:
-            self._timer.stop()'''
-
         while len(dados) > 0:
             payload = dados[:MSS]
             
@@ -182,11 +180,12 @@ class Conexao:
             self.seq_no += len(payload)
 
             self._buffer.append((segment, dest_addr, self.seq_no))  # Passei pra ca pois quando receber o ACK eu vou comparar com o seq atualizado
-
             dados = dados[MSS:]
         
-        self._timer = Timer(1, self._retransmit())
-        self._timer.start()
+        #print('Passei')
+        if self._timer == None:
+            self._timer = Timer(1, self._retransmit())
+            self._timer.start()
 
 
     def fechar(self):
