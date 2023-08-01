@@ -7,6 +7,23 @@ FLAGS_SYN = 1<<1
 FLAGS_RST = 1<<2
 FLAGS_ACK = 1<<4
 
+class Timer:
+    def __init__(self, timeout, callback):
+        self._callback = callback
+        self._timeout = timeout
+        self._timer = None
+        
+    
+    def start(self):
+        self.stop()
+        self._timer = asyncio.get_event_loop().call_later(self._timeout, self._callback)
+  
+    def stop(self):
+        if self._timer != None:
+            self._timer.cancel()
+        
+
+
 class Servidor:
     def __init__(self, rede, porta):
         self.rede = rede
@@ -42,18 +59,17 @@ class Servidor:
             conexao = self.conexoes[id_conexao] = Conexao(self, id_conexao, seq_no)
             # TODO: você precisa fazer o handshake aceitando a conexão. Escolha se você acha melhor
             # fazer aqui mesmo ou dentro da classe Conexao.
-            conexao.hand_shake(seq_no)
+            conexao._hand_shake(seq_no)
             if self.callback:
                 self.callback(conexao)
-        elif (flags & FLAGS_FIN) == FLAGS_FIN:
-            # A flag FIN estar setada significa que é um cliente tentando finalizar uma conexão existente
-            conexao = self.conexoes.pop(id_conexao)
-            conexao.end_connection()
-            #conexao.fechar()
 
         elif id_conexao in self.conexoes:
+            if (flags & FLAGS_FIN) == FLAGS_FIN:
+                conexao = self.conexoes.pop(id_conexao)
+                conexao._end_connection()
             # Passa para a conexão adequada se ela já estiver estabelecida
-            self.conexoes[id_conexao]._rdt_rcv(seq_no, ack_no, flags, payload)
+            else:
+                self.conexoes[id_conexao]._rdt_rcv(seq_no, ack_no, flags, payload)
         else:
             print('%s:%d -> %s:%d (pacote associado a conexão desconhecida)' %
                   (src_addr, src_port, dst_addr, dst_port))
@@ -68,52 +84,78 @@ class Conexao:
         self.seq_no_raw = servidor.random_no()[0]
         self.seq_no = self.seq_no_raw
         self.ack_no = 0
-        self.flags = FLAGS_ACK
+
+        self._buffer = []
+        self._send_base = self.seq_no_raw
+        self._timer = None
 
         self.servidor = servidor
         self.id_conexao = id_conexao
-        self.callback = None
-        self.timer = asyncio.get_event_loop().call_later(1, self._exemplo_timer)  # um timer pode ser criado assim; esta linha é só um exemplo e pode ser removida
-        #self.timer.cancel()   # é possível cancelar o timer chamando esse método; esta linha é só um exemplo e pode ser removida
+        self.callback = None    
 
-    def _exemplo_timer(self):
-        # Esta função é só um exemplo e pode ser removida
-        print('Este é um exemplo de como fazer um timer')
+    def _ack_handler(self, ack_no):
+        if ack_no <= self._send_base: return
+
+        self._send_base = ack_no
+
+        for i in range(len(self._buffer)):
+            if self._buffer[i][2] == self._send_base:
+                self._buffer = self._buffer[i:]
+                break
+        
+        if len(self._buffer) > 0:
+            self._timer.start()
+        elif self._timer != None:
+            self._timer.stop()
 
     def _rdt_rcv(self, seq_no, ack_no, flags, payload):
         # TODO: trate aqui o recebimento de segmentos provenientes da camada de rede.
         # Chame self.callback(self, dados) para passar dados para a camada de aplicação após
         # garantir que eles não sejam duplicados e que tenham sido recebidos em ordem.
-        if seq_no != self.ack_no: return
-        if payload == b'': return
+        if seq_no != self.ack_no: return   # Ignora segmentos errados e fora de ordem
 
-        #self.seq_no += len(payload)
+        if ((flags & FLAGS_ACK) == FLAGS_ACK) and (payload == b''):
+            self._ack_handler(ack_no)
+            return  # Impede responder ACKS com outros ACKs
+
         self.callback(self, payload)
 
         self.ack_no = seq_no + len(payload)
-        self.send_ack()
+        self._send_ack()
 
         print('recebido payload: %r' % payload)
     
-    def send_ack(self):
-        seq_no = self.seq_no
-        ack_no = self.ack_no
+    def _retransmit(self):
+        dados, dest_addr, _ = self._buffer[0]
+        self.servidor.rede.enviar(dados, dest_addr)
 
+        self._timer = Timer(1, self._retransmit)
+        self._timer.start()
+    
+    def _send_ack(self):
         dest_addr, dest_port, src_addr, src_port = self.id_conexao
-
-        header = make_header(src_port, dest_port, seq_no, ack_no, FLAGS_ACK)
+        header = make_header(src_port, dest_port, self.seq_no, self.ack_no, FLAGS_ACK)
         segment = fix_checksum(header, src_addr, dest_addr)
 
         self.servidor.rede.enviar(segment, dest_addr)
 
-    # Os métodos abaixo fazem parte da API
+    def _hand_shake(self, seq_no_sender):
+        self.ack_no = seq_no_sender + 1
 
-    def registrar_recebedor(self, callback):
-        """
-        Usado pela camada de aplicação para registrar uma função para ser chamada
-        sempre que dados forem corretamente recebidos
-        """
-        self.callback = callback
+        dest_addr, dest_port, src_addr, src_port = self.id_conexao
+        header = make_header(src_port, dest_port, self.seq_no, self.ack_no, FLAGS_ACK | FLAGS_SYN)
+        segment = fix_checksum(header, src_addr, dest_addr)
+
+        self.servidor.rede.enviar(segment, dest_addr)
+        self.seq_no += 1
+    
+    def _end_connection(self):
+        self.callback(self, b'')
+        self.ack_no += 1
+        self._send_ack()
+
+
+    ''' Os métodos abaixo fazem parte da API '''
 
     def enviar(self, dados=b''):
         """
@@ -124,62 +166,50 @@ class Conexao:
         # que você construir para a camada de rede.
         dest_addr, dest_port, src_addr, src_port = self.id_conexao
 
-        flags = self.flags
+        '''if self._timer != None:
+            self._timer.stop()'''
 
         while len(dados) > 0:
-            seq_no = self.seq_no
-            ack_no = self.ack_no
-            
             payload = dados[:MSS]
             
-            header = make_header(src_port, dest_port, seq_no, ack_no, flags)
+            header = make_header(src_port, dest_port, self.seq_no, self.ack_no, FLAGS_ACK)
             segment = fix_checksum(header + payload, src_addr, dest_addr)
 
-            self.servidor.rede.enviar(segment, dest_addr)      
+            self.servidor.rede.enviar(segment, dest_addr)
+
+            #self._buffer.append((segment, dest_addr, self.seq_no))
+
             self.seq_no += len(payload)
 
-            dados = dados[MSS:]
+            self._buffer.append((segment, dest_addr, self.seq_no))  # Passei pra ca pois quando receber o ACK eu vou comparar com o seq atualizado
 
-        pass
+            dados = dados[MSS:]
+        
+        self._timer = Timer(1, self._retransmit())
+        self._timer.start()
+
 
     def fechar(self):
         """
         Usado pela camada de aplicação para fechar a conexão
         """
         # TODO: implemente aqui o fechamento de conexão
-        self.callback(self, b'')
         dest_addr, dest_port, src_addr, src_port = self.id_conexao
 
-        ack_no = self.ack_no
-        seq_no = self.seq_no
-        flags = FLAGS_FIN
-
-        header = make_header(src_port, dest_port, seq_no, ack_no, flags)
+        header = make_header(src_port, dest_port, self.seq_no, self.ack_no, FLAGS_FIN)
         segment = fix_checksum(header, src_addr, dest_addr)
 
         self.servidor.rede.enviar(segment, dest_addr)
 
-        pass
-
-    def hand_shake(self, seq_no_sender):
-        dest_addr, dest_port, src_addr, src_port = self.id_conexao
-
-        ack_no = self.ack_no = seq_no_sender + 1
-        seq_no = self.seq_no
-        flags = self.flags | FLAGS_SYN
-
-        header = make_header(src_port, dest_port, seq_no, ack_no, flags)
-        segment = fix_checksum(header, src_addr, dest_addr)
-
-        self.servidor.rede.enviar(segment, dest_addr)
-        self.seq_no += 1
-    
-    def end_connection(self):
-        self.callback(self, b'')
-        self.ack_no += 1
-        self.send_ack()
+        # TODO: perguntar se é necessário incrementar o seq_no
 
 
+    def registrar_recebedor(self, callback):
+        """
+        Usado pela camada de aplicação para registrar uma função para ser chamada
+        sempre que dados forem corretamente recebidos
+        """
+        self.callback = callback
 
 
 
