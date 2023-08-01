@@ -11,16 +11,16 @@ class Timer:
     def __init__(self, timeout, callback):
         self._callback = callback
         self._timeout = timeout
-        self._timer = None
+        self._task = None
         
     
     def start(self):
         self.stop()
-        self._timer = asyncio.get_event_loop().call_later(self._timeout, self._callback)
+        self._task = asyncio.get_event_loop().call_later(self._timeout, self._callback)
   
     def stop(self):
-        if self._timer != None:
-            self._timer.cancel()
+        if self._task != None:
+            self._task.cancel()
         
 
 
@@ -99,10 +99,13 @@ class Conexao:
         if self._timer == None: return
 
         self._send_base = ack_no
+        print('Tamanho do buffer: ', len(self._buffer))
         for i in range(len(self._buffer)):
+            print(self._buffer[i][2], self._send_base)
             if self._buffer[i][2] == self._send_base:
-                self._buffer = self._buffer[i:]
+                self._buffer = self._buffer[i+1:]
                 break
+        print('Tamanho do buffer final: ', len(self._buffer))
         
         if len(self._buffer) > 0:
             self._timer.start()
@@ -184,7 +187,7 @@ class Conexao:
         
         #print('Passei')
         if self._timer == None:
-            self._timer = Timer(1, self._retransmit())
+            self._timer = Timer(1, self._retransmit)
             self._timer.start()
 
 
