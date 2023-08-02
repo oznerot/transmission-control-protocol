@@ -1,6 +1,7 @@
 import asyncio
 from os import urandom
 from tcputils import *
+from time import time
 
 FLAGS_FIN = 1<<0
 FLAGS_SYN = 1<<1
@@ -21,6 +22,9 @@ class Timer:
     def stop(self):
         if self._task != None:
             self._task.cancel()
+    
+    def update_timer(self, timeout):
+        self._timeout = timeout
         
 
 
@@ -87,7 +91,12 @@ class Conexao:
 
         self._buffer = []
         self._send_base = self.seq_no_raw
+
         self._timer = None
+        self._time_interval = 1
+        self._estimatedRTT = 0
+        self._devRTT = 0
+        self._first_sampleRTT = True
 
         self.servidor = servidor
         self.id_conexao = id_conexao
@@ -99,19 +108,44 @@ class Conexao:
         if self._timer == None: return
 
         self._send_base = ack_no
-        print('Tamanho do buffer: ', len(self._buffer))
         for i in range(len(self._buffer)):
             print(self._buffer[i][2], self._send_base)
             if self._buffer[i][2] == self._send_base:
+                self._calc_timeout(self._buffer[i][3])
                 self._buffer = self._buffer[i+1:]
                 break
-        print('Tamanho do buffer final: ', len(self._buffer))
         
         if len(self._buffer) > 0:
             self._timer.start()
         else:
             self._timer.stop()
             self._timer = None
+
+
+
+    def _calc_timeout(self, t0):
+        sampleRTT = time() - t0
+        print('SampleRTT: ', sampleRTT)
+
+        if self._first_sampleRTT:
+            self._calc_timeout_first_time(sampleRTT)
+            
+        else:
+            alpha = 0.125
+            self._estimatedRTT = (1 - alpha)*self._estimatedRTT + alpha*sampleRTT
+
+            beta = 0.25
+            self._devRTT = (1 - beta)*self._devRTT + beta*abs(sampleRTT - self._estimatedRTT)
+
+        #self._time_interval = self._estimatedRTT + 4*self._devRTT
+        #self._timer.update_timer(self._time_interval)
+    
+    def _calc_timeout_first_time(self, sampleRTT):
+        self._estimatedRTT = sampleRTT
+        self._devRTT = sampleRTT/2
+        self._first_sampleRTT = False
+
+
 
     def _rdt_rcv(self, seq_no, ack_no, flags, payload):
         # TODO: trate aqui o recebimento de segmentos provenientes da camada de rede.
@@ -131,7 +165,7 @@ class Conexao:
     def _retransmit(self):
         if self._timer == None: return
 
-        dados, dest_addr, _ = self._buffer[0]
+        dados, dest_addr, _, _ = self._buffer[0]
         self.servidor.rede.enviar(dados, dest_addr)
 
         self._timer.start()
@@ -171,21 +205,20 @@ class Conexao:
         dest_addr, dest_port, src_addr, src_port = self.id_conexao
 
         while len(dados) > 0:
+            
             payload = dados[:MSS]
             
             header = make_header(src_port, dest_port, self.seq_no, self.ack_no, FLAGS_ACK)
             segment = fix_checksum(header + payload, src_addr, dest_addr)
 
+            t0 = time()
             self.servidor.rede.enviar(segment, dest_addr)
-
-            #self._buffer.append((segment, dest_addr, self.seq_no))
 
             self.seq_no += len(payload)
 
-            self._buffer.append((segment, dest_addr, self.seq_no))  # Passei pra ca pois quando receber o ACK eu vou comparar com o seq atualizado
+            self._buffer.append((segment, dest_addr, self.seq_no, t0))  # Passei pra ca pois quando receber o ACK eu vou comparar com o seq atualizado
             dados = dados[MSS:]
         
-        #print('Passei')
         if self._timer == None:
             self._timer = Timer(1, self._retransmit)
             self._timer.start()
