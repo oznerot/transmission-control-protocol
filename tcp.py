@@ -13,8 +13,7 @@ class Timer:
         self._callback = callback
         self._timeout = timeout
         self._task = None
-        
-    
+          
     def start(self):
         self.stop()
         self._task = asyncio.get_event_loop().call_later(self._timeout, self._callback)
@@ -93,10 +92,15 @@ class Conexao:
         self._send_base = self.seq_no_raw
 
         self._timer = None
-        self._time_interval = 1
+        self._time_interval = 0.5
         self._estimatedRTT = 0
         self._devRTT = 0
         self._first_sampleRTT = True
+
+        self._queue = []
+
+        self._win_frontier = self._send_base + MSS
+        self._cwnd_size = MSS
 
         self.servidor = servidor
         self.id_conexao = id_conexao
@@ -107,21 +111,20 @@ class Conexao:
         if len(self._buffer) == 0: return
         if self._timer == None: return
 
-        self._send_base = ack_no
-        for i in range(len(self._buffer)):
-            print(self._buffer[i][2], self._send_base)
-            if self._buffer[i][2] == self._send_base:
-                self._calc_timeout(self._buffer[i][3])
-                self._buffer = self._buffer[i+1:]
-                break
+        '''if ack_no >= self._win_frontier:
+            self._additive_increase()'''
+
+        self._search_segment_in_buffer(ack_no)
         
         if len(self._buffer) > 0:
-            self._timer.start()
+            self._timer.start() 
         else:
             self._timer.stop()
             self._timer = None
 
-
+    def _additive_increase(self):
+        self._cwnd_size += MSS
+        self._win_frontier = self._send_base + self._cwnd_size
 
     def _calc_timeout(self, t0):
         sampleRTT = time() - t0
@@ -137,16 +140,33 @@ class Conexao:
             beta = 0.25
             self._devRTT = (1 - beta)*self._devRTT + beta*abs(sampleRTT - self._estimatedRTT)
 
-        #self._time_interval = self._estimatedRTT + 4*self._devRTT
-        #self._timer.update_timer(self._time_interval)
+        self._time_interval = self._estimatedRTT + 4*self._devRTT
+        self._timer.update_timer(self._time_interval)
     
     def _calc_timeout_first_time(self, sampleRTT):
         self._estimatedRTT = sampleRTT
         self._devRTT = sampleRTT/2
         self._first_sampleRTT = False
+    
+    def _end_connection(self):
+        self.callback(self, b'')
+        self.ack_no += 1
+        self._send_ack()
+    
+    def _hand_shake(self, seq_no_sender):
+        self.ack_no = seq_no_sender + 1
 
+        dest_addr, dest_port, src_addr, src_port = self.id_conexao
+        header = make_header(src_port, dest_port, self.seq_no, self.ack_no, FLAGS_ACK | FLAGS_SYN)
+        segment = fix_checksum(header, src_addr, dest_addr)
 
-
+        self.servidor.rede.enviar(segment, dest_addr)
+        self.seq_no += 1
+    
+    def _multiplicative_decrease(self):
+        self._cwnd_size = max(1, self._cwnd_size // 2)
+        self._win_frontier = self._send_base + self._cwnd_size
+    
     def _rdt_rcv(self, seq_no, ack_no, flags, payload):
         # TODO: trate aqui o recebimento de segmentos provenientes da camada de rede.
         # Chame self.callback(self, dados) para passar dados para a camada de aplicação após
@@ -163,12 +183,26 @@ class Conexao:
         print('recebido payload: %r' % payload)
     
     def _retransmit(self):
+        #self._multiplicative_decrease()
         if self._timer == None: return
-
-        dados, dest_addr, _, _ = self._buffer[0]
-        self.servidor.rede.enviar(dados, dest_addr)
-
+        header, payload, src_addr, dest_addr, seq, t0, _ = self._buffer[0]
+        self._buffer[0] = (header, payload, src_addr, dest_addr, seq, t0, False) 
+        #dados, dest_addr, _, _, _ = self._buffer[0]
+        segment = fix_checksum(header + payload, src_addr, dest_addr)
+        self.servidor.rede.enviar(segment, dest_addr)
         self._timer.start()
+    
+    def _search_segment_in_buffer(self, ack_no):
+        self._send_base = ack_no
+        for i in range(len(self._buffer)):
+            _, payload,_, _, seq, t0, is_first = self._buffer[i]
+            if seq == ack_no:
+                if is_first:
+                    self._calc_timeout(t0)
+
+                self._buffer = self._buffer[i+1:]
+                
+                return
     
     def _send_ack(self):
         dest_addr, dest_port, src_addr, src_port = self.id_conexao
@@ -177,37 +211,18 @@ class Conexao:
 
         self.servidor.rede.enviar(segment, dest_addr)
 
-    def _hand_shake(self, seq_no_sender):
-        self.ack_no = seq_no_sender + 1
-
-        dest_addr, dest_port, src_addr, src_port = self.id_conexao
-        header = make_header(src_port, dest_port, self.seq_no, self.ack_no, FLAGS_ACK | FLAGS_SYN)
-        segment = fix_checksum(header, src_addr, dest_addr)
-
-        self.servidor.rede.enviar(segment, dest_addr)
-        self.seq_no += 1
-    
-    def _end_connection(self):
-        self.callback(self, b'')
-        self.ack_no += 1
-        self._send_ack()
-
-
     ''' Os métodos abaixo fazem parte da API '''
 
     def enviar(self, dados=b''):
         """
         Usado pela camada de aplicação para enviar dados
         """
-        # TODO: implemente aqui o envio de dados.
-        # Chame self.servidor.rede.enviar(segmento, dest_addr) para enviar o segmento
-        # que você construir para a camada de rede.
         dest_addr, dest_port, src_addr, src_port = self.id_conexao
 
         while len(dados) > 0:
-            
-            payload = dados[:MSS]
-            
+            mss = self._cwnd_size
+            payload = dados[:mss]
+
             header = make_header(src_port, dest_port, self.seq_no, self.ack_no, FLAGS_ACK)
             segment = fix_checksum(header + payload, src_addr, dest_addr)
 
@@ -216,19 +231,17 @@ class Conexao:
 
             self.seq_no += len(payload)
 
-            self._buffer.append((segment, dest_addr, self.seq_no, t0))  # Passei pra ca pois quando receber o ACK eu vou comparar com o seq atualizado
-            dados = dados[MSS:]
+            self._buffer.append((header, payload, src_addr, dest_addr, self.seq_no, t0, True))  # Passei pra ca pois quando receber o ACK eu vou comparar com o seq atualizado
+            dados = dados[mss:]
         
         if self._timer == None:
-            self._timer = Timer(1, self._retransmit)
+            self._timer = Timer(self._time_interval, self._retransmit)
             self._timer.start()
-
 
     def fechar(self):
         """
         Usado pela camada de aplicação para fechar a conexão
         """
-        # TODO: implemente aqui o fechamento de conexão
         dest_addr, dest_port, src_addr, src_port = self.id_conexao
 
         header = make_header(src_port, dest_port, self.seq_no, self.ack_no, FLAGS_FIN)
@@ -236,16 +249,6 @@ class Conexao:
 
         self.servidor.rede.enviar(segment, dest_addr)
 
-        # TODO: perguntar se é necessário incrementar o seq_no
-
 
     def registrar_recebedor(self, callback):
-        """
-        Usado pela camada de aplicação para registrar uma função para ser chamada
-        sempre que dados forem corretamente recebidos
-        """
         self.callback = callback
-
-
-
-    
